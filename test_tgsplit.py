@@ -518,37 +518,6 @@ class RestoreTests(TempCase):
             tg.restore_archives([self.tmp / "two-out" / "two.0001.tar"], dest, log=lambda s: None)
 
 
-class LegacyJoinTests(TempCase):
-    def make_legacy(self):
-        folder = self.tmp / "legacy"
-        folder.mkdir()
-        raw = io.BytesIO()
-        with tarfile.open(fileobj=raw, mode="w", format=tarfile.PAX_FORMAT) as tar:
-            payload = os.urandom(20000)
-            info = tarfile.TarInfo("folder/file.bin")
-            info.size = len(payload)
-            info.mtime = 1_600_000_000
-            tar.addfile(info, io.BytesIO(payload))
-        data = raw.getvalue()
-        cuts = [0, 1000, 7000, len(data)]
-        for i in range(3):
-            (folder / "old.tar.{:03d}".format(i + 1)).write_bytes(data[cuts[i]:cuts[i + 1]])
-        (folder / "old.tar.sha256").write_text("{}  old.tar\n".format(hashlib.sha256(data).hexdigest()))
-        return folder, data, payload
-
-    def test_extract_and_merge_only(self):
-        folder, data, payload = self.make_legacy()
-        extracted = self.tmp / "legacy-restored"
-        tg.join_files(folder, extracted, log=lambda s: None)
-        self.assertEqual((extracted / "folder" / "file.bin").read_bytes(), payload)
-        merged = self.tmp / "legacy-merged"
-        result = tg.join_dispatch([folder], merged, merge_only=True, log=lambda s: None)
-        self.assertEqual(result[0].read_bytes(), data)
-        cli_out = self.tmp / "legacy-cli"
-        self.assertEqual(tg.main(["join", str(folder / "old.tar.002"), "-o", str(cli_out)]), 0)
-        self.assertEqual((cli_out / "folder" / "file.bin").read_bytes(), payload)
-
-
 class ExtendTests(TempCase):
     def test_new_files_and_done_move_without_rebuilding_old_archives(self):
         root = self.tree("ext")
@@ -767,6 +736,275 @@ class LargeSparseSmokeTest(TempCase):
                   size, split_seconds, size / tg.MiB / split_seconds,
                   restore_seconds, size / tg.MiB / restore_seconds,
                   tg.human(python_peak), tg.human(process_peak) if process_peak else "unknown"))
+
+
+class SpeedAndLazyHashTests(TempCase):
+    def make_photos(self, count=40, size_range=(500, 20000)):
+        src = self.tree("photos")
+        rnd = random.Random(4)
+        for i in range(count):
+            p = src / "d{}".format(i % 4) / "IMG_{:03d}.jpg".format(i)
+            p.parent.mkdir(exist_ok=True)
+            p.write_bytes(os.urandom(rnd.randint(*size_range)))
+        return src
+
+    def test_plan_is_built_without_hashing_and_hashes_appear_on_write(self):
+        src = self.make_photos()
+        (src / "big.bin").write_bytes(os.urandom(300 * 1024))
+        out = self.tmp / "out"
+        original = tg.hash_file
+        calls = []
+
+        def spy(path, *args, **kwargs):
+            calls.append(str(path))
+            return original(path, *args, **kwargs)
+
+        tg.hash_file = spy
+        try:
+            plan = tg.save_plan_only([src], out, 100 * 1024, "p", log=lambda s: None)
+        finally:
+            tg.hash_file = original
+        self.assertEqual(calls, [], "построение плана не должно читать содержимое файлов")
+        self.assertFalse(any(f.get("sha256") for f in plan["files"]))
+        done = tg.split_plan([], out, log=lambda s: None)
+        for f in done["files"]:
+            if f["type"] == "file":
+                self.assertEqual(f["sha256"], hashlib.sha256(Path(f["source"]).read_bytes()).hexdigest())
+
+    def test_incremental_packing_equals_estimate_and_is_maximal(self):
+        rnd = random.Random(8)
+        for part in (64 * 1024, 300 * 1024, 2 * tg.MiB):
+            files = []
+            for i in range(400):
+                name = rnd.choice(["IMG_{}.jpg", "фото_{}.jpg", "a/b/" + "x" * rnd.randint(1, 120) + "_{}"]).format(i)
+                kind = "dir" if i % 25 == 0 else "file"
+                files.append({"source": "/s/" + name, "path": name, "mode": 420, "mtime": 1, "mtime_ns": 10 ** 9,
+                              "type": kind, "size": 0 if kind == "dir" else rnd.choice([0, 1, 700, 20000, part // 3])})
+            plan = {"plan_id": "p" * 64, "format": 2, "name": "n", "sources": [],
+                    "parameters": {"part_size": part}, "files": files, "skipped": []}
+            archives = tg.pack_entries(plan, part)
+            for current, following in zip(archives, archives[1:]):
+                self.assertEqual(current["size"], tg.archive_estimate(plan, current))
+                self.assertLessEqual(current["size"], part)
+                # «жадность»: первый элемент следующего архива в этот не помещался
+                trial = dict(current)
+                trial["entries"] = current["entries"] + [following["entries"][0]]
+                if "fragment" not in following["entries"][0]:
+                    self.assertGreater(tg.archive_estimate(plan, trial), part)
+
+    def test_fragmenting_works_for_every_path_length(self):
+        # Раньше около 3% длин пути давали «оценка больше размера части» из-за цифр в манифесте.
+        part = 100 * tg.MiB
+        for length in range(1, 220):
+            for name in ("x" * length, "a/b/" + "x" * length):
+                entry = {"source": "/s/" + name, "path": name, "mode": 420, "mtime": 5, "mtime_ns": 5 * 10 ** 9,
+                         "type": "file", "size": 300 * 10 ** 6}
+                plan = {"plan_id": "p" * 64, "format": 2, "name": "n", "sources": [],
+                        "parameters": {"part_size": part}, "files": [entry], "skipped": []}
+                archives = tg.pack_entries(plan, part)
+                self.assertEqual(sum(a["entries"][0]["size"] for a in archives), 300 * 10 ** 6)
+
+    def test_legacy_plan_with_hashes_still_detects_pending_move_by_hash(self):
+        src = self.make_photos(count=12)
+        out = self.tmp / "out"
+        tg.save_plan_only([src], out, 60 * 1024, "p", log=lambda s: None)
+        plan = tg.load_plan(out)
+        for f in plan["files"]:  # так выглядел план старой версии
+            if f["type"] == "file":
+                f["sha256"] = tg.hash_file(f["source"])
+        tg.atomic_json(tg.plan_path(out), plan)
+        (src / "d1").rename(src / "d1_moved")
+        extended = tg.extend_plan(out, plan_only=True, log=lambda s: None)
+        moves = extended["extensions"][-1]["moves"]
+        self.assertTrue(moves and all(m["target"].startswith("photos/d1_moved/") for m in moves))
+        self.assertEqual(extended["extensions"][-1]["added"].count("photos/d1_moved"), 1)
+        self.assertFalse([p for p in extended["extensions"][-1]["added"] if p.endswith(".jpg")])
+
+    def test_prebuilt_plan_is_reused_without_rescanning(self):
+        src = self.make_photos(count=10)
+        out = self.tmp / "out"
+        preview = tg.make_plan([src], out, 80 * 1024, "p", log=lambda s: None)
+        shutil.rmtree(src)  # если бы источники сканировались заново, это бы упало
+        tg.save_plan_only([src], out, 80 * 1024, "p", log=lambda s: None, prebuilt=preview)
+        saved = tg.load_plan(out)
+        self.assertEqual(saved["plan_id"], preview["plan_id"])
+        self.assertEqual(saved["archives"], preview["archives"])
+
+    def test_cached_plan_loading_follows_file_changes(self):
+        src = self.make_photos(count=10)
+        out = self.tmp / "out"
+        tg.save_plan_only([src], out, 80 * 1024, "p", log=lambda s: None)
+        first = tg.load_plan_cached(out)
+        self.assertIs(first, tg.load_plan_cached(out))
+        tg.split_plan([], out, max_parts=1, log=lambda s: None)
+        second = tg.load_plan_cached(out)
+        self.assertIsNot(first, second)
+        self.assertEqual(second["archives"][0]["status"], "done")
+
+    def test_verify_reports_progress_and_can_be_cancelled(self):
+        src = self.make_photos(count=10)
+        out = self.tmp / "out"
+        tg.split_plan([src], out, 80 * 1024, "p", log=lambda s: None)
+        seen = []
+        self.assertGreater(tg.verify_archives(out, log=lambda s: None, progress=lambda d, t: seen.append((d, t))), 0)
+        self.assertTrue(seen)
+        import threading
+        stop = threading.Event()
+        stop.set()
+        with self.assertRaises(tg.Cancelled):
+            tg.verify_archives(out, log=lambda s: None, cancel=stop)
+
+
+class GuiWorkflowTests(TempCase):
+    """Нажимает настоящие кнопки окна (нужны tkinter и дисплей, иначе тест пропускается)."""
+
+    def test_full_workflow(self):
+        try:
+            import tkinter as tk
+            from tkinter import filedialog, messagebox, ttk
+            probe = tk.Tk()
+            probe.destroy()
+        except Exception as e:
+            self.skipTest("Tk или дисплей недоступны: {}".format(e))
+        src = self.tree("photos")
+        rnd = random.Random(5)
+        for i in range(80):
+            p = src / "d{}".format(i % 4) / "IMG_{:03d}.jpg".format(i)
+            p.parent.mkdir(exist_ok=True)
+            p.write_bytes(os.urandom(rnd.randint(1000, 30000)))
+        out, rest = self.tmp / "out", self.tmp / "rest"
+        problems = []
+        dialog = {"dir": None}
+        saved = (tk.Tk.mainloop, filedialog.askdirectory, messagebox.showerror,
+                 messagebox.showwarning, messagebox.showinfo)
+        result = {}
+
+        def walk(widget):
+            yield widget
+            for child in widget.winfo_children():
+                yield from walk(child)
+
+        def drive(root):
+            def find(cls, text=None, nth=0):
+                return [w for w in walk(root) if isinstance(w, cls) and (text is None or str(w.cget("text")) == text)][nth]
+
+            def click(text, nth=0):
+                button = find(ttk.Button, text, nth)
+                self.assertNotEqual(str(button.cget("state")), "disabled", text)
+                button.invoke()
+
+            def setvar(label, value):
+                lab = find(ttk.Label, label)
+                for w in lab.master.grid_slaves(row=lab.grid_info()["row"], column=1):
+                    root.setvar(str(w.cget("textvariable")), value)
+                    return
+                raise KeyError(label)
+
+            def wait():
+                cancel = find(ttk.Button, "Отмена")
+                deadline = time.time() + 60
+                time.sleep(0.05)
+                while time.time() < deadline:
+                    root.update()
+                    if str(cancel.cget("state")) == "disabled":
+                        break
+                    time.sleep(0.02)
+                for _ in range(10):
+                    root.update()
+                    time.sleep(0.02)
+
+            def log():
+                return [w for w in walk(root) if isinstance(w, tk.Text)][0].get("1.0", "end")
+
+            dialog["dir"] = str(src)
+            click("Добавить папку…", 0)
+            setvar("Папка результата:", str(out))
+            setvar("Размер архива:", "100K")
+            root.update()
+            time.sleep(0.6)
+            root.update()
+            click("Показать план")
+            wait()
+            self.assertIn("не сохранён", log())
+            click("Показать план")
+            wait()
+            self.assertIn("Показан ранее построенный план", log())
+            click("Сохранить план")
+            wait()
+            self.assertIn("Использован уже построенный план", log())
+            time.sleep(0.6)
+            root.update()
+            click("Показать план")
+            wait()
+            self.assertIn("пересчёта нет", log())
+            setvar("Только архивы с номерами:", "2,3")
+            click("Продолжить")
+            wait()
+            states = [a["status"] for a in tg.load_plan(out)["archives"]]
+            self.assertEqual(states[:3], ["pending", "done", "done"])
+            old_hash = tg.load_plan(out)["archives"][1]["sha256"]
+            setvar("Только архивы с номерами:", "")
+            setvar("Пересоздать архивы с номерами:", "2")
+            click("Продолжить")
+            wait()
+            self.assertEqual(tg.load_plan(out)["archives"][1]["sha256"], old_hash)
+            setvar("Пересоздать архивы с номерами:", "")
+            setvar("Сколько архивов создать сейчас:", "1")
+            click("Продолжить")
+            wait()
+            self.assertEqual(sum(a["status"] == "done" for a in tg.load_plan(out)["archives"]), 3)
+            setvar("Сколько архивов создать сейчас:", "")
+            click("Продолжить")
+            wait()
+            total = len(tg.load_plan(out)["archives"])
+            self.assertTrue(all(a["status"] == "done" for a in tg.load_plan(out)["archives"]))
+            click("Статус")
+            self.assertIn("Готово", log())
+            click("Проверить архивы")
+            wait()
+            self.assertIn("Проверено присутствующих архивов: {}".format(total), log())
+            (src / "d0" / "new1.bin").write_bytes(os.urandom(5000))
+            create_box = find(ttk.Checkbutton, "и сразу создать архивы (по полю «Сколько архивов»)")
+            root.setvar(str(create_box.cget("variable")), 1)
+            click("Обновить план")
+            wait()
+            self.assertIn("новые архивы созданы", log())
+            find(ttk.Notebook).select(1)
+            root.update()
+            dialog["dir"] = str(out)
+            click("Добавить папку…", 1)
+            setvar("Куда восстановить:", str(rest))
+            click("Восстановить")
+            wait()
+            self.assertIn("Восстановление завершено", log())
+            self.assertTrue((rest / "photos" / "d0" / "new1.bin").exists())
+            result["ok"] = True
+            root.destroy()
+
+        def fake_mainloop(self_root, n=0):
+            try:
+                drive(self_root)
+            except BaseException as e:
+                result["error"] = e
+                try:
+                    self_root.destroy()
+                except Exception:
+                    pass
+
+        tk.Tk.mainloop = fake_mainloop
+        filedialog.askdirectory = lambda **kw: dialog["dir"]
+        messagebox.showerror = lambda t, m, **kw: problems.append(("error", t, m))
+        messagebox.showwarning = lambda t, m, **kw: problems.append(("warning", t, m))
+        messagebox.showinfo = lambda t, m, **kw: problems.append(("info", t, m))
+        try:
+            tg.run_gui()
+        finally:
+            (tk.Tk.mainloop, filedialog.askdirectory, messagebox.showerror,
+             messagebox.showwarning, messagebox.showinfo) = saved
+        if "error" in result:
+            raise result["error"]
+        self.assertTrue(result.get("ok"))
+        self.assertEqual([p for p in problems if p[0] == "error"], [])
 
 
 if __name__ == "__main__":

@@ -16,8 +16,10 @@ copy /b в порядке номеров.
 файлы. ACL, xattr, атрибуты Windows, uid/gid и жёсткие связи не сохраняются.
 Источники не должны меняться: перед архивом и после него проверяются размер
 и mtime_ns. Обычное продолжение игнорирует новые файлы. Команда extend добавляет
-их в новые архивы, а перенесённые файлы распознаёт по сохранённому SHA256,
-не пересоздавая старые архивы и сохраняя исходный plan_id.
+их в новые архивы, а перенесённые файлы распознаёт по SHA256 (или, если файл ещё
+не записан в архив, по размеру и mtime), не пересоздавая старые архивы и сохраняя
+исходный plan_id. SHA256 не считается при построении плана: он записывается в план
+при создании архива, поэтому план строится без чтения содержимого файлов.
 
 Консоль:
     python tgsplit.py plan ПУТЬ... -o OUT [-s 1900M]
@@ -31,8 +33,7 @@ copy /b в порядке номеров.
 Команда plan — сухой запуск: архивы не создаются, но план сохраняется атомарно.
 При повторном планировании после потери plan.json статусы существующих архивов
 восстанавливаются из их манифестов. Удалённые архивы будут созданы заново.
-Без аргументов открывается графическое окно. Старый потоковый формат
-name.tar.001, name.tar.002, … по-прежнему поддерживается командой join.
+Без аргументов открывается графическое окно.
 
 Только стандартная библиотека, Python 3.8+. Для перетаскивания в GUI можно
 отдельно установить tkinterdnd2; без него GUI и консоль работают полностью.
@@ -41,6 +42,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import copy
 import hashlib
 import io
 import json
@@ -66,7 +68,6 @@ BLOCK = 512
 RECORD = 10240
 FORMAT_VERSION = 2
 RESTORE_STATE = ".tgsplit-restore.json"
-PART_RE = re.compile(r"^(?P<base>.+)\.(?P<num>\d{3,})$")
 ARCHIVE_RE = re.compile(r"^(?P<base>.+)\.(?P<num>\d{4})\.tar$")
 
 
@@ -206,13 +207,17 @@ def _fits(plan, archive, entry, part_size):
 
 
 def _max_fragment(plan, logical, part_size):
+    # Оценка берётся «с запасом по цифрам»: у последующих фрагментов смещение, номер
+    # фрагмента и номер архива длиннее, чем у первого. Иначе оценка последнего
+    # фрагмента могла перешагнуть границу 512-байтного блока и превысить размер части.
+    worst = logical["size"] // BLOCK + 1
     base = {
-        "path": fragment_name(logical["path"], 1), "source_path": logical["path"],
+        "path": fragment_name(logical["path"], worst), "source_path": logical["path"],
         "type": "file", "size": 0, "mode": logical["mode"], "mtime": logical["mtime"],
-        "fragment": {"index": 1, "count": 1, "offset": 0, "length": 0,
+        "fragment": {"index": worst, "count": worst, "offset": logical["size"], "length": 0,
                      "total_size": logical["size"]},
     }
-    archive = _new_archive(1)
+    archive = _new_archive(99999)
     archive["entries"] = [base]
     fixed = metadata_cost(plan, archive) + BLOCK + pax_cost(base["path"])
     high = max(0, (part_size - fixed) // BLOCK)
@@ -248,20 +253,68 @@ def _stored_whole(logical):
     return result
 
 
+def _entry_numbers(entry):
+    """(длина JSON элемента, вклад в entries.sha256, стоимость в TAR) — считается один раз на элемент."""
+    return (len(canonical_json(entry)),
+            68 + len(entry["path"].encode("utf-8", "surrogateescape")),
+            stored_entry_cost(entry))
+
+
+class _Fill:
+    """Инкрементальная оценка размера архива.
+
+    Формулы те же, что в archive_estimate, но добавление элемента стоит O(1), а не
+    пересериализацию всего манифеста: раньше упаковка тысяч мелких файлов (фото)
+    была квадратичной.
+    """
+
+    def __init__(self, plan, index):
+        self.base = len(canonical_json(manifest_for_archive(plan, {"index": index, "entries": []}, 0)))
+        self.count = 0
+        self.json = 0
+        self.paths = 0
+        self.stored = 0
+
+    def estimate(self, nums=None):
+        count, js, paths, stored = self.count, self.json, self.paths, self.stored
+        if nums is not None:
+            count += 1
+            js += nums[0]
+            paths += nums[1]
+            stored += nums[2]
+        manifest_len = self.base + js + max(count - 1, 0)
+        return (BLOCK + round_up(manifest_len + 1024) + BLOCK + round_up(paths + 128) +
+                round_up(1024, RECORD) + stored)
+
+    def fits(self, nums, part_size):
+        return self.estimate(nums) <= part_size
+
+    def add(self, nums):
+        self.count += 1
+        self.json += nums[0]
+        self.paths += nums[1]
+        self.stored += nums[2]
+
+
 def pack_entries(plan, part_size):
     archives = []
     current = None
+    fill = None
     for logical in plan["files"]:
         whole = _stored_whole(logical)
-        if current is not None and _fits(plan, current, whole, part_size):
+        nums = _entry_numbers(whole)
+        if current is not None and fill.fits(nums, part_size):
             current["entries"].append(whole)
+            fill.add(nums)
             continue
         empty = _new_archive(current["index"] + 1 if current is not None else len(archives) + 1)
-        if _fits(plan, empty, whole, part_size):
+        empty_fill = _Fill(plan, empty["index"])
+        if empty_fill.fits(nums, part_size):
             if current is not None:
                 archives.append(_finish_archive(plan, current, part_size))
             empty["entries"].append(whole)
-            current = empty
+            empty_fill.add(nums)
+            current, fill = empty, empty_fill
             continue
         if logical["type"] != "file":
             raise ValueError("Элемент не помещается в архив: {}".format(logical["path"]))
@@ -281,6 +334,8 @@ def pack_entries(plan, part_size):
                 archives.append(archive)
             else:
                 current = archive
+                fill = _Fill(plan, archive["index"])
+                fill.add(_entry_numbers(frag))
             offset += length
     if current is not None:
         archives.append(_finish_archive(plan, current, part_size))
@@ -320,7 +375,7 @@ def _logical_from_stat(source, arcname, st):
     return base
 
 
-def scan_sources(paths, log=print, progress=None, cancel=None):
+def scan_sources(paths, log=print, progress=None, cancel=None, hash_files=False):
     tops = [Path(os.path.abspath(str(p))) for p in paths]
     if not tops:
         raise ValueError("Не выбрано ни одного файла или папки")
@@ -353,7 +408,7 @@ def scan_sources(paths, log=print, progress=None, cancel=None):
         try:
             st = os.lstat(str(source))
             logical = _logical_from_stat(source, arcname, st)
-            if logical["type"] == "file":
+            if logical["type"] == "file" and hash_files:
                 size = logical["size"]
                 if size >= HASH_LOG_THRESHOLD:
                     log("Хэширование: {} ({})".format(source, human(size)))
@@ -387,7 +442,10 @@ def calculate_plan_id(sources, part_size, files):
 def make_plan(paths, out_dir, part_size=DEFAULT_PART_SIZE, name=None, log=print,
               progress=None, cancel=None):
     out = Path(os.path.abspath(str(out_dir)))
+    started = time.time()
     sources, files, skipped = scan_sources(paths, log=log, progress=progress, cancel=cancel)
+    log("Просмотрено элементов: {} за {:.1f} с (SHA256 считается позже, при записи архивов)".format(
+        len(files), time.time() - started))
     if not name:
         name = sources[0]["name"] if len(sources) == 1 else "archive"
     name = Path(name).name
@@ -401,7 +459,9 @@ def make_plan(paths, out_dir, part_size=DEFAULT_PART_SIZE, name=None, log=print,
         "parameters": {"part_size": part_size}, "files": files, "skipped": skipped,
     }
     plan["plan_id"] = calculate_plan_id(sources, part_size, files)
+    started = time.time()
     plan["archives"] = pack_entries(plan, part_size)
+    log("Разбито на {} архивов за {:.1f} с".format(len(plan["archives"]), time.time() - started))
     return plan
 
 
@@ -426,12 +486,34 @@ def load_plan(out, name=None):
     return plan
 
 
+_PLAN_CACHE = {}
+
+
+def load_plan_cached(out, name=None):
+    """load_plan с кэшем по (путь, mtime, размер): повторный показ плана не читает файл заново.
+
+    Возвращённый план нельзя изменять: он общий. Для изменений используйте load_plan.
+    """
+    path = plan_path(out, name)
+    st = os.stat(str(path))
+    key = (st.st_mtime_ns, st.st_size)
+    hit = _PLAN_CACHE.get(str(path))
+    if hit is not None and hit[0] == key:
+        return hit[1]
+    plan = load_plan(path)
+    _PLAN_CACHE[str(path)] = (key, plan)
+    return plan
+
+
 def print_plan(plan, log=print):
     log("План {}: {} архивов, {}".format(plan["name"], len(plan["archives"]), human(
         sum(f["size"] for f in plan["files"] if f["type"] == "file"))))
     for a in plan["archives"]:
         log("  {:04d}: {:3d} элементов, оценка {}, {}".format(
             a["index"], len(a["entries"]), human(a["size"]), a["status"]))
+    done = sum(a["status"] == "done" for a in plan["archives"])
+    if done:
+        log("Готово архивов: {} из {}".format(done, len(plan["archives"])))
     if plan["skipped"]:
         log("Пропущено: {}".format(len(plan["skipped"])))
 
@@ -464,16 +546,23 @@ def recover_archives(plan, out_dir, log=print):
 
 
 def create_plan(paths, out_dir, part_size=DEFAULT_PART_SIZE, name=None, log=print, recover=False,
-                progress=None, cancel=None):
+                progress=None, cancel=None, prebuilt=None):
     out = Path(os.path.abspath(str(out_dir)))
     out.mkdir(parents=True, exist_ok=True)
-    plan = make_plan(paths, out, part_size, name, log, progress, cancel)
+    if prebuilt is not None:
+        # План уже построен (например, кнопкой «Показать план»): не сканируем заново.
+        plan = copy.deepcopy(prebuilt)
+        log("Использован уже построенный план, источники не пересканировались")
+    else:
+        plan = make_plan(paths, out, part_size, name, log, progress, cancel)
     path = out / "{}.plan.json".format(plan["name"])
     if path.exists():
         raise ValueError("План уже существует: {}".format(path))
     if recover:
         recover_archives(plan, out, log)
+    started = time.time()
     atomic_json(path, plan)
+    log("План записан за {:.1f} с: {}".format(time.time() - started, path.name))
     return plan
 
 
@@ -590,7 +679,8 @@ def warn_new_files(plan, indices, log=print):
 
 
 def split_plan(paths, out_dir, part_size=DEFAULT_PART_SIZE, name=None, max_parts=None,
-               only=None, redo=None, log=print, progress=None, cancel=None, hash_progress=None):
+               only=None, redo=None, log=print, progress=None, cancel=None, hash_progress=None,
+               prebuilt=None):
     out = Path(os.path.abspath(str(out_dir)))
     out.mkdir(parents=True, exist_ok=True)
     existing = None
@@ -618,9 +708,9 @@ def split_plan(paths, out_dir, part_size=DEFAULT_PART_SIZE, name=None, max_parts
         else:
             if not paths:
                 raise ValueError("Для продолжения нужен существующий plan.json")
-            log("Сканирование и вычисление SHA256 исходных файлов…")
+            log("Сканирование исходных файлов…")
             plan = create_plan(paths, out, part_size, name, log, recover=True,
-                               progress=hash_progress, cancel=cancel)
+                               progress=hash_progress, cancel=cancel, prebuilt=prebuilt)
         total = len(plan["archives"])
         if redo is not None:
             if only is not None or max_parts is not None:
@@ -659,7 +749,7 @@ def split_plan(paths, out_dir, part_size=DEFAULT_PART_SIZE, name=None, max_parts
 
 
 def save_plan_only(paths, out_dir, part_size=DEFAULT_PART_SIZE, name=None, log=print,
-                   progress=None, cancel=None):
+                   progress=None, cancel=None, prebuilt=None):
     """Построить и сохранить NAME.plan.json без создания архивов."""
     out = Path(os.path.abspath(str(out_dir)))
     out.mkdir(parents=True, exist_ok=True)
@@ -667,9 +757,9 @@ def save_plan_only(paths, out_dir, part_size=DEFAULT_PART_SIZE, name=None, log=p
         raise ValueError("В папке результата уже есть план; используйте «Продолжить»")
     lock_name = name or (Path(paths[0]).name if len(paths) == 1 else "archive")
     with plan_lock(out, lock_name):
-        log("Сканирование и вычисление SHA256 исходных файлов…")
+        log("Сканирование исходных файлов…")
         plan = create_plan(paths, out, part_size, name, log, recover=True,
-                           progress=progress, cancel=cancel)
+                           progress=progress, cancel=cancel, prebuilt=prebuilt)
         log("План сохранён: {}".format(out / "{}.plan.json".format(plan["name"])))
         print_plan(plan, log)
         return plan
@@ -784,6 +874,15 @@ def validate_new_sources(plan, out_dir, paths):
 
 
 def _move_operations_and_sources(out_dir, plan, current, log=print, progress=None, cancel=None):
+    """Найти новые файлы и переносы.
+
+    Новые файлы больше не хэшируются: их SHA256 появится при записи в архив.
+    Старый файл, исчезнувший с прежнего места:
+      * если его содержимое ещё нигде не записано (SHA256 неизвестен, архивы ожидают) —
+        сопоставляется с новым файлом того же размера и mtime без чтения данных: в архив
+        всё равно попадёт содержимое нового места, а операция move переименует его;
+      * иначе сопоставляется по SHA256 (из плана или, если её нет, по готовым архивам).
+    """
     previous = plan["files"]
     previous_sources = {f["source"] for f in previous}
     current_sources = {f["source"] for f in current}
@@ -793,6 +892,12 @@ def _move_operations_and_sources(out_dir, plan, current, log=print, progress=Non
     by_size = {}
     for item in candidates:
         by_size.setdefault(item["size"], []).append(item)
+    written = set()
+    for archive in plan["archives"]:
+        if archive["status"] == "done":
+            for entry in archive["entries"]:
+                if entry["type"] == "file":
+                    written.add(entry.get("source_path", entry["path"]))
     paired = set()
     hashes = {}
     operations = []
@@ -809,7 +914,21 @@ def _move_operations_and_sources(out_dir, plan, current, log=print, progress=Non
             hashes[path] = hash_file(path, file_progress, cancel)
         return hashes[path]
 
+    def pair(old, new):
+        paired.add(new["source"])
+        old_path = old.get("current_path", old["path"])
+        operations.append({"type": "move", "source": old_path, "target": new["path"]})
+        old["source"] = new["source"]
+        old["current_path"] = new["path"]
+        log("Перенос распознан: {} -> {}".format(old_path, new["path"]))
+
     for old in sorted(missing, key=lambda f: f.get("current_path", f["path"])):
+        if not old.get("sha256") and old["path"] not in written:
+            for new in sorted(by_size.get(old["size"], []), key=lambda f: f["path"]):
+                if new["source"] not in paired and new["mtime_ns"] == old["mtime_ns"]:
+                    pair(old, new)
+                    break
+            continue
         try:
             old_digest = planned_file_hash(out_dir, plan, old)
         except OSError:
@@ -822,17 +941,9 @@ def _move_operations_and_sources(out_dir, plan, current, log=print, progress=Non
                     continue
             except OSError:
                 continue
-            paired.add(new["source"])
-            old_path = old.get("current_path", old["path"])
-            operations.append({"type": "move", "source": old_path, "target": new["path"]})
-            old["source"] = new["source"]
-            old["current_path"] = new["path"]
-            log("Перенос распознан по SHA256: {} -> {}".format(old_path, new["path"]))
+            pair(old, new)
             break
     new_entries = [f for f in added if f["source"] not in paired]
-    for entry in new_entries:
-        if entry["type"] == "file":
-            entry["sha256"] = digest(entry["source"])
     return new_entries, operations
 
 
@@ -867,7 +978,7 @@ def extend_plan(out_dir, name=None, max_parts=None, plan_only=False,
         plan["sources"].extend(added_sources)
         for source in added_sources:
             log("Новый корневой источник: {} -> {}".format(source["path"], source["name"]))
-        log("Сканирование и вычисление SHA256 новых файлов…")
+        log("Сканирование новых файлов…")
         current, skipped = scan_existing_sources(plan, log)
         new_entries, operations = _move_operations_and_sources(out, plan, current, log, progress, cancel)
         if not new_entries and not operations:
@@ -1086,6 +1197,19 @@ def build_archive(plan, out_dir, index, progress=None, cancel=None, log=print):
     else:
         stored = archive
     check_sources(plan, stored, "предварительная проверка")
+    # SHA256 всего файла нужен для распознавания переносов (extend). Обычные файлы
+    # хэшируются «бесплатно» прямо при записи в архив. Файлы, режущиеся на фрагменты,
+    # хэшируются один раз целиком здесь, потому что их части лежат в разных архивах.
+    for entry in stored["entries"]:
+        if entry["type"] != "file" or "fragment" not in entry:
+            continue
+        logical = files[entry["source_path"]]
+        if not logical.get("sha256"):
+            size = logical["size"]
+            log("Хэширование большого файла перед нарезкой: {} ({})".format(logical["source"], human(size)))
+            logical["sha256"] = hash_file(logical["source"],
+                                          (lambda done, size=size: progress(done, size)) if progress else None,
+                                          cancel)
     free = shutil.disk_usage(str(out)).free
     if free < archive["size"]:
         raise OSError("Не хватает места для одного архива: нужно {}, свободно {}".format(
@@ -1127,6 +1251,8 @@ def build_archive(plan, out_dir, index, progress=None, cancel=None, log=print):
                 if reader.remaining:
                     raise IntegrityError("Не весь файл записан: {}".format(logical["source"]))
                 hashes[entry["path"]] = reader.sha256.hexdigest()
+                if fragment is None:
+                    logical["sha256"] = hashes[entry["path"]]
             tracker["done"] += entry["size"]
             if progress:
                 progress(tracker["done"], total)
@@ -1783,7 +1909,7 @@ def hash_file(path, progress=None, cancel=None):
     return digest.hexdigest()
 
 
-def verify_archives(out_dir, name=None, log=print):
+def verify_archives(out_dir, name=None, log=print, progress=None, cancel=None):
     plan = load_plan(out_dir, name)
     out = plan_path(out_dir, name).parent
     checked = 0
@@ -1795,7 +1921,8 @@ def verify_archives(out_dir, name=None, log=print):
         if expected is None:
             log("ВНИМАНИЕ: нет или повреждён файл {}.sha256".format(path.name))
             continue
-        actual = hash_file(path)
+        size = path.stat().st_size
+        actual = hash_file(path, (lambda done, size=size: progress(done, size)) if progress else None, cancel)
         if actual != expected:
             raise IntegrityError("Контрольная сумма не совпала: {}".format(path.name))
         if archive.get("sha256") and archive["sha256"] != actual:
@@ -1804,170 +1931,6 @@ def verify_archives(out_dir, name=None, log=print):
         log("OK: {}".format(path.name))
     log("Проверено присутствующих архивов: {}".format(checked))
     return checked
-
-
-class LegacyJoinReader:
-    def __init__(self, parts, progress=None, cancel=None):
-        self.parts = parts
-        self.progress = progress
-        self.cancel = cancel
-        self.index = 0
-        self.fileobj = None
-        self.sha256 = hashlib.sha256()
-        self.done = 0
-        self.total = sum(p.stat().st_size for p in parts)
-
-    def read(self, size=-1):
-        if self.cancel is not None and self.cancel.is_set():
-            raise Cancelled()
-        if size is None or size < 0:
-            size = CHUNK
-        chunks = []
-        remaining = size
-        while remaining:
-            if self.fileobj is None:
-                if self.index >= len(self.parts):
-                    break
-                self.fileobj = open(str(self.parts[self.index]), "rb")
-                self.index += 1
-            data = self.fileobj.read(min(remaining, CHUNK))
-            if not data:
-                self.fileobj.close()
-                self.fileobj = None
-                continue
-            chunks.append(data)
-            remaining -= len(data)
-            self.sha256.update(data)
-            self.done += len(data)
-            if self.progress:
-                self.progress(self.done, self.total)
-        return b"".join(chunks)
-
-    def close(self):
-        if self.fileobj is not None:
-            self.fileobj.close()
-            self.fileobj = None
-
-
-def find_legacy_groups(path, log=print):
-    path = Path(os.path.abspath(str(path)))
-    folder = path if path.is_dir() else path.parent
-    strict = path.is_file()
-    if not path.exists():
-        raise ValueError("Не найдено: {}".format(path))
-    groups = {}
-    for item in folder.iterdir():
-        match = PART_RE.match(item.name)
-        if match and item.is_file():
-            groups.setdefault(match["base"], {})[int(match["num"])] = item
-    if strict:
-        match = PART_RE.match(path.name)
-        if not match:
-            raise ValueError("Ожидается часть name.tar.001 или папка")
-        groups = {match["base"]: groups.get(match["base"], {})}
-    result = []
-    for base, numbered in sorted(groups.items()):
-        if 1 not in numbered:
-            if strict:
-                raise ValueError("«{}»: нет части .001".format(base))
-            continue
-        top = max(numbered)
-        missing = [i for i in range(1, top + 1) if i not in numbered]
-        if missing:
-            raise ValueError("«{}»: не хватает частей {}".format(base, missing))
-        result.append((base, [numbered[i] for i in range(1, top + 1)]))
-    if not result:
-        raise ValueError("Старые части .001 не найдены")
-    return result
-
-
-def legacy_expected_hash(parts, base):
-    try:
-        return (parts[0].parent / (base + ".sha256")).read_text(encoding="utf-8").split()[0].lower()
-    except (OSError, IndexError, UnicodeError):
-        return None
-
-
-def join_legacy_one(base, parts, out_dir, merge_only=False, log=print, progress=None, cancel=None):
-    out = Path(out_dir)
-    out.mkdir(parents=True, exist_ok=True)
-    reader = LegacyJoinReader(parts, progress, cancel)
-    expected = legacy_expected_hash(parts, base)
-    extract = base.lower().endswith((".tar", ".tar.gz", ".tgz")) and not merge_only
-    result = out
-    log("Собираю старый формат «{}»: {} частей".format(base, len(parts)))
-    try:
-        if extract:
-            tar = tarfile.open(fileobj=reader, mode="r|*", bufsize=CHUNK)
-            directories = []
-            for member in tar:
-                extract_foreign_member(tar, member, out, "overwrite", directories, cancel)
-            tar.close()
-            for entry in sorted(directories, key=lambda e: len(e["path"].split("/")), reverse=True):
-                apply_file_attributes(safe_target(out, entry["path"], False), entry["mode"], entry["mtime"])
-            while reader.read(CHUNK):
-                pass
-        else:
-            result = out / base
-            if os.path.lexists(str(result)):
-                raise ValueError("Файл уже существует: {}".format(result))
-            if shutil.disk_usage(str(out)).free < reader.total:
-                raise OSError("Не хватает места для склейки")
-            try:
-                with open(str(result), "wb") as f:
-                    while True:
-                        data = reader.read(CHUNK)
-                        if not data:
-                            break
-                        f.write(data)
-            except BaseException:
-                try:
-                    result.unlink()
-                except OSError:
-                    pass
-                raise
-        actual = reader.sha256.hexdigest()
-        if expected is None:
-            log("ВНИМАНИЕ: рядом нет {}.sha256".format(base))
-        elif actual != expected:
-            raise IntegrityError("Контрольная сумма старого набора не совпала: {}".format(base))
-        else:
-            log("Контрольная сумма совпала")
-        return result
-    finally:
-        reader.close()
-
-
-def join_files(path, out_dir=None, merge_only=False, log=print, progress=None, cancel=None):
-    results = []
-    for base, parts in find_legacy_groups(path, log):
-        target = Path(os.path.abspath(str(out_dir))) if out_dir else parts[0].parent / "restored"
-        results.append(join_legacy_one(base, parts, target, merge_only, log, progress, cancel))
-    return results
-
-
-def join_dispatch(inputs, out_dir=None, on_exist="skip", keep_partial=True, merge_only=False,
-                  log=print, progress=None, cancel=None):
-    has_legacy_file = any(Path(str(p)).is_file() and PART_RE.match(Path(str(p)).name) for p in inputs)
-    has_new_file = any(Path(str(p)).is_file() and Path(str(p)).suffix.lower() == ".tar" for p in inputs)
-    if has_legacy_file and not has_new_file:
-        results = []
-        for path in inputs:
-            results.extend(join_files(path, out_dir, merge_only, log, progress, cancel))
-        return results
-    folders = [Path(str(p)) for p in inputs if Path(str(p)).is_dir()]
-    legacy_in_folders = False
-    for folder in folders:
-        if any(PART_RE.match(p.name) and p.is_file() for p in folder.iterdir()):
-            legacy_in_folders = True
-    if legacy_in_folders and not has_new_file:
-        new_tar_exists = any(any(p.is_file() and p.suffix.lower() == ".tar" for p in folder.iterdir()) for folder in folders)
-        if not new_tar_exists:
-            results = []
-            for folder in folders:
-                results.extend(join_files(folder, out_dir, merge_only, log, progress, cancel))
-            return results
-    return restore_archives(inputs, out_dir, on_exist, keep_partial, log, progress, cancel)
 
 
 class ConsoleProgress:
@@ -2056,15 +2019,18 @@ def run_gui():
             if path not in sources:
                 sources.append(path)
                 source_list.insert("end", path)
+        schedule_refresh()
 
     def remove_sources():
         for index in reversed(source_list.curselection()):
             source_list.delete(index)
             del sources[index]
+        schedule_refresh()
 
     def clear_sources():
         sources.clear()
         source_list.delete(0, "end")
+        schedule_refresh()
 
     source_buttons = ttk.Frame(split_tab)
     source_buttons.pack(fill="x", pady=(0, 6))
@@ -2091,6 +2057,9 @@ def run_gui():
     name_split = tk.StringVar()
     size_split = tk.StringVar(value="1900M")
     max_parts = tk.StringVar()
+    only_split = tk.StringVar()
+    redo_split = tk.StringVar()
+    create_after = tk.BooleanVar(value=False)
     plan_status = tk.StringVar(value="План ещё не выбран")
 
     def pick_dir(variable):
@@ -2111,9 +2080,15 @@ def run_gui():
     ttk.Label(form, text="Сколько архивов создать сейчас:").grid(row=3, column=0, sticky="w", pady=3)
     ttk.Entry(form, textvariable=max_parts, width=12).grid(row=3, column=1, sticky="w", padx=6)
     ttk.Label(form, text="пусто — все ожидающие", foreground="gray").grid(row=3, column=2, sticky="w")
-    ttk.Label(form, textvariable=plan_status, foreground="gray").grid(row=4, column=0, columnspan=3, sticky="w", pady=4)
+    ttk.Label(form, text="Только архивы с номерами:").grid(row=4, column=0, sticky="w", pady=3)
+    ttk.Entry(form, textvariable=only_split, width=12).grid(row=4, column=1, sticky="w", padx=6)
+    ttk.Label(form, text="ожидающие, например 6,7", foreground="gray").grid(row=4, column=2, sticky="w")
+    ttk.Label(form, text="Пересоздать архивы с номерами:").grid(row=5, column=0, sticky="w", pady=3)
+    ttk.Entry(form, textvariable=redo_split, width=12).grid(row=5, column=1, sticky="w", padx=6)
+    ttk.Label(form, text="уже готовые, например 3", foreground="gray").grid(row=5, column=2, sticky="w")
+    ttk.Label(form, textvariable=plan_status, foreground="gray").grid(row=6, column=0, columnspan=3, sticky="w", pady=4)
 
-    ttk.Label(join_tab, text="Архивы .tar (можно несколько и в любом порядке), папка или старые .tar.001:").pack(anchor="w")
+    ttk.Label(join_tab, text="Архивы .tar (можно несколько и в любом порядке) или папка:").pack(anchor="w")
     join_frame = ttk.Frame(join_tab)
     join_frame.pack(fill="x", pady=4)
     join_list = tk.Listbox(join_frame, height=6, activestyle="none")
@@ -2147,12 +2122,15 @@ def run_gui():
     join_form.columnconfigure(1, weight=1)
     out_join = tk.StringVar()
     on_exist = tk.StringVar(value="skip")
+    discard_partial = tk.BooleanVar(value=False)
     ttk.Label(join_form, text="Куда восстановить:").grid(row=0, column=0, sticky="w", pady=3)
     ttk.Entry(join_form, textvariable=out_join).grid(row=0, column=1, sticky="ew", padx=6)
     ttk.Button(join_form, text="Обзор…", command=lambda: pick_dir(out_join)).grid(row=0, column=2)
     ttk.Label(join_form, text="Если файл существует:").grid(row=1, column=0, sticky="w", pady=3)
     ttk.Combobox(join_form, textvariable=on_exist, values=("skip", "overwrite", "rename"),
                  state="readonly", width=12).grid(row=1, column=1, sticky="w", padx=6)
+    ttk.Checkbutton(join_form, text="Удалить неполные .tgspart после отчёта (по умолчанию сохраняются)",
+                    variable=discard_partial).grid(row=2, column=0, columnspan=3, sticky="w", pady=2)
     ttk.Label(join_tab, text="Неполные файлы .tgspart сохраняются: можно продолжить с любым следующим окном архивов.",
               foreground="gray", wraplength=680).pack(anchor="w")
 
@@ -2161,21 +2139,30 @@ def run_gui():
     controls = ttk.Frame(bottom)
     controls.pack(fill="x", pady=(6, 2))
     controls2 = ttk.Frame(bottom)
-    controls2.pack(fill="x", pady=(0, 4))
+    controls2.pack(fill="x", pady=(0, 2))
+    controls3 = ttk.Frame(bottom)
+    controls3.pack(fill="x", pady=(0, 4))
     run_button = ttk.Button(controls, text="Разбить")
     show_plan_button = ttk.Button(controls, text="Показать план")
     save_plan_button = ttk.Button(controls, text="Сохранить план")
     extend_button = ttk.Button(controls2, text="Обновить план", state="disabled")
     add_to_plan_button = ttk.Button(controls2, text="Добавить папку…", state="disabled")
     cancel_button = ttk.Button(controls, text="Отмена", state="disabled", command=cancel.set)
-    open_button = ttk.Button(controls, text="Открыть папку результата", state="disabled",
-                             command=lambda: open_folder(state["out"]))
+    status_button = ttk.Button(controls3, text="Статус")
+    verify_button = ttk.Button(controls3, text="Проверить архивы")
+    open_plan_button = ttk.Button(controls3, text="Открыть файл плана")
+    open_button = ttk.Button(controls, text="Открыть папку результата")
     run_button.pack(side="left")
     show_plan_button.pack(side="left", padx=6)
     save_plan_button.pack(side="left")
     cancel_button.pack(side="left", padx=6)
     extend_button.pack(side="left")
     add_to_plan_button.pack(side="left", padx=6)
+    ttk.Checkbutton(controls2, text="и сразу создать архивы (по полю «Сколько архивов»)",
+                    variable=create_after).pack(side="left", padx=6)
+    status_button.pack(side="left")
+    verify_button.pack(side="left", padx=6)
+    open_plan_button.pack(side="left")
     open_button.pack(side="right")
     progress_bar = ttk.Progressbar(bottom, maximum=1000)
     progress_bar.pack(fill="x")
@@ -2188,6 +2175,45 @@ def run_gui():
     log_text.configure(yscrollcommand=log_scroll.set)
     log_text.pack(side="left", fill="both", expand=True)
     log_scroll.pack(side="right", fill="y")
+
+    def _log_copy(event=None):
+        try:
+            text = log_text.get("sel.first", "sel.last")
+        except tk.TclError:
+            return "break"
+        log_text.clipboard_clear()
+        log_text.clipboard_append(text)
+        return "break"
+
+    def _log_select_all(event=None):
+        log_text.tag_add("sel", "1.0", "end-1c")
+        return "break"
+
+    def _log_ctrl_key(event):
+        # Ctrl+C / Ctrl+A при любой раскладке (в русской keysym другой, keycode 67/65 на Windows).
+        keysym = str(event.keysym).lower()
+        if keysym in ("c", "cyrillic_es") or (sys.platform == "win32" and event.keycode == 67):
+            return _log_copy()
+        if keysym in ("a", "cyrillic_ef") or (sys.platform == "win32" and event.keycode == 65):
+            return _log_select_all()
+        return None
+
+    log_menu = tk.Menu(log_text, tearoff=0)
+    log_menu.add_command(label="Копировать", command=_log_copy)
+    log_menu.add_command(label="Выделить всё", command=_log_select_all)
+
+    def _log_popup(event):
+        log_text.focus_set()
+        log_menu.tk_popup(event.x_root, event.y_root)
+        return "break"
+
+    # У Text в состоянии disabled клик не даёт фокус, и Ctrl+C не доходит до виджета.
+    log_text.bind("<Button-1>", lambda e: log_text.focus_set(), add="+")
+    log_text.bind("<Control-KeyPress>", _log_ctrl_key)
+    log_text.bind("<Control-Insert>", _log_copy)
+    log_text.bind("<Button-3>", _log_popup)
+    if sys.platform == "darwin":
+        log_text.bind("<Button-2>", _log_popup)
 
     def add_log(message):
         log_text.configure(state="normal")
@@ -2206,10 +2232,27 @@ def run_gui():
             last_progress[0] = now
             events.put(("progress", done, total))
 
+    def default_out():
+        """Папка результата по умолчанию: <родитель источника>/<имя>_parts (как при запуске «Разбить»)."""
+        if not sources:
+            return ""
+        name = name_split.get().strip() or None
+        base = name or (Path(sources[0]).name if len(sources) == 1 else "archive")
+        return str(Path(sources[0]).parent / (base + "_parts"))
+
+    def adopt_default_out():
+        """Поле пустое, но в папке по умолчанию уже есть план: подставить её, чтобы план нашёлся."""
+        if out_split.get().strip() or state["locked"]:
+            return
+        candidate = default_out()
+        if candidate and plan_exists(candidate):
+            out_split.set(candidate)
+
     def refresh_plan(*_):
+        adopt_default_out()
         folder = out_split.get().strip()
         try:
-            plan = load_plan(folder, name_split.get().strip() or None) if folder else None
+            plan = load_plan_cached(folder, name_split.get().strip() or None) if folder else None
         except (ValueError, OSError):
             plan = None
         if plan is not None:
@@ -2244,23 +2287,123 @@ def run_gui():
             if notebook.index("current") == 0:
                 run_button.configure(text="Разбить")
 
-    out_split.trace_add("write", refresh_plan)
+    refresh_job = [None]
+
+    def schedule_refresh(*_):
+        # Не читаем план на каждое нажатие клавиши: ждём, пока ввод остановится.
+        if refresh_job[0] is not None:
+            root.after_cancel(refresh_job[0])
+        refresh_job[0] = root.after(400, refresh_plan)
+
+    out_split.trace_add("write", schedule_refresh)
+
+    def plan_exists(folder):
+        return bool(folder) and Path(folder).is_dir() and any(Path(folder).glob("*.plan.json"))
+
+    def preview_key(folder):
+        return (tuple(sources), parse_size(size_split.get()), name_split.get().strip() or None, folder)
+
+    def preview_plan():
+        """Ранее построенный (ещё не сохранённый) план, если параметры не менялись."""
+        if state["locked"] or not sources:
+            return None
+        folder = out_split.get().strip() or default_out()
+        try:
+            cached = state.get("preview")
+            if cached and cached["key"] == preview_key(folder):
+                return cached["plan"]
+        except ValueError:
+            pass
+        return None
 
     def show_plan():
+        adopt_default_out()
         folder = out_split.get().strip()
-        try:
-            if folder and list(Path(folder).glob("*.plan.json")):
-                print_plan(load_plan(folder, name_split.get().strip() or None), add_log)
-            elif sources:
-                plan = make_plan(sources, folder or Path(sources[0]).parent, parse_size(size_split.get()),
-                                 name_split.get().strip() or None, add_log)
-                print_plan(plan, add_log)
-            else:
-                messagebox.showwarning("Нет плана", "Добавьте источники или выберите папку с существующим планом.")
-        except Exception as e:
-            messagebox.showerror("План", str(e))
+        name = name_split.get().strip() or None
+        has_plan = plan_exists(folder)
+        if not has_plan and not sources:
+            messagebox.showwarning("Нет плана", "Добавьте источники или выберите папку с существующим планом.")
+            return
+        if has_plan:
+            def job():
+                started = time.time()
+                plan = load_plan_cached(folder, name)
+                log("План прочитан за {:.1f} с, пересчёта нет".format(time.time() - started))
+                print_plan(plan, log)
+                return gui_plan_summary(plan)
+        else:
+            try:
+                target = folder or default_out()
+                key = preview_key(target)
+                size = key[1]
+            except ValueError as e:
+                messagebox.showerror("План", str(e))
+                return
+            snapshot = list(sources)
+
+            def job():
+                cached = state.get("preview")
+                if cached and cached["key"] == key:
+                    plan = cached["plan"]
+                    log("Показан ранее построенный план: файлы не пересканировались")
+                else:
+                    plan = make_plan(snapshot, target, size, name, log, progress, cancel)
+                    state["preview"] = {"key": key, "plan": plan}
+                print_plan(plan, log)
+                log("План пока не сохранён. «Сохранить план» или «Разбить» запишут его без повторного сканирования.")
+                return "План построен, не сохранён. " + gui_plan_summary(plan)
+
+        start(job)
 
     show_plan_button.configure(command=show_plan)
+
+    def open_target():
+        if notebook.index("current") == 1:
+            target = out_join.get().strip() or state["out"]
+        else:
+            target = out_split.get().strip() or state["out"]
+        if target and Path(target).exists():
+            open_folder(target)
+        else:
+            messagebox.showinfo("Папка", "Папка ещё не создана.")
+
+    open_button.configure(command=open_target)
+
+    def open_plan_file():
+        try:
+            open_folder(plan_path(out_split.get().strip(), name_split.get().strip() or None))
+        except (ValueError, OSError) as e:
+            messagebox.showwarning("План", "План не найден: {}".format(e))
+
+    open_plan_button.configure(command=open_plan_file)
+
+    def do_status():
+        adopt_default_out()
+        try:
+            plan = load_plan_cached(out_split.get().strip(), name_split.get().strip() or None)
+        except (ValueError, OSError) as e:
+            messagebox.showwarning("Статус", "План не найден: {}".format(e))
+            return
+        add_log("— Статус плана {} —".format(plan["name"]))
+        print_status(plan, add_log)
+
+    status_button.configure(command=do_status)
+
+    def do_verify():
+        adopt_default_out()
+        folder = out_split.get().strip()
+        if not plan_exists(folder):
+            messagebox.showwarning("Проверка", "Выберите папку с существующим планом.")
+            return
+        name = name_split.get().strip() or None
+
+        def job():
+            checked = verify_archives(folder, name, log, progress, cancel)
+            return "Проверено присутствующих архивов: {}".format(checked)
+
+        start(job)
+
+    verify_button.configure(command=do_verify)
 
     def start(job):
         if state["running"]:
@@ -2272,8 +2415,9 @@ def run_gui():
         save_plan_button.configure(state="disabled")
         extend_button.configure(state="disabled")
         add_to_plan_button.configure(state="disabled")
+        status_button.configure(state="disabled")
+        verify_button.configure(state="disabled")
         cancel_button.configure(state="normal")
-        open_button.configure(state="disabled")
         progress_bar["value"] = 0
         log_text.configure(state="normal")
         log_text.delete("1.0", "end")
@@ -2304,15 +2448,17 @@ def run_gui():
             name = name_split.get().strip() or None
             folder = out_split.get().strip()
             if not folder:
-                base = name or (Path(sources[0]).name if len(sources) == 1 else "archive")
-                folder = str(Path(sources[0]).parent / (base + "_parts"))
+                folder = default_out()
                 out_split.set(folder)
             locked = state["locked"]
+            only = only_split.get().strip() or None
+            redo = redo_split.get().strip() or None
+            prebuilt = preview_plan()
 
             def job():
                 plan = split_plan([] if locked else list(sources), folder, size, name, count,
-                                  log=log, progress=progress, cancel=cancel,
-                                  hash_progress=progress)
+                                  only, redo, log=log, progress=progress, cancel=cancel,
+                                  hash_progress=progress, prebuilt=None if locked else prebuilt)
                 state["out"] = folder
                 return gui_plan_summary(plan)
 
@@ -2326,10 +2472,20 @@ def run_gui():
             messagebox.showwarning("Нет плана", "Сначала выберите папку с существующим планом.")
             return
         try:
+            create = create_after.get()
+            count_text = max_parts.get().strip()
+            count = int(count_text) if (create and count_text) else None
+            if count is not None and count < 1:
+                raise ValueError("Число архивов должно быть положительным")
+
+            name = name_split.get().strip() or None
+
             def job():
-                plan = extend_plan(folder, name_split.get().strip() or None, None, True,
+                plan = extend_plan(folder, name, count, not create,
                                    log=log, progress=progress, cancel=cancel)
                 state["out"] = folder
+                if create:
+                    return "План обновлён, новые архивы созданы. " + gui_plan_summary(plan)
                 return "План обновлён; архивы создаст «Продолжить». " + gui_plan_summary(plan)
 
             start(job)
@@ -2347,8 +2503,10 @@ def run_gui():
         if not new_dir:
             return
         try:
+            name = name_split.get().strip() or None
+
             def job():
-                plan = extend_plan(folder, name_split.get().strip() or None, None, True,
+                plan = extend_plan(folder, name, None, True,
                                    log=log, progress=progress, cancel=cancel, add_paths=[new_dir])
                 state["out"] = folder
                 return "Папка добавлена в план; архивы создаст «Продолжить». " + gui_plan_summary(plan)
@@ -2368,12 +2526,13 @@ def run_gui():
             name = name_split.get().strip() or None
             folder = out_split.get().strip()
             if not folder:
-                base = name or (Path(sources[0]).name if len(sources) == 1 else "archive")
-                folder = str(Path(sources[0]).parent / (base + "_parts"))
+                folder = default_out()
                 out_split.set(folder)
 
+            prebuilt = preview_plan()
+
             def job():
-                plan = save_plan_only(list(sources), folder, size, name, log, progress, cancel)
+                plan = save_plan_only(list(sources), folder, size, name, log, progress, cancel, prebuilt)
                 state["out"] = folder
                 return "План сохранён. " + gui_plan_summary(plan)
 
@@ -2388,14 +2547,16 @@ def run_gui():
             messagebox.showwarning("Нечего восстанавливать", "Добавьте архивы или папку.")
             return
 
+        keep_partial = not discard_partial.get()
+        target = out_join.get().strip() or None
+        mode = on_exist.get()
+        inputs = list(join_sources)
+
         def job():
-            result = join_dispatch(list(join_sources), out_join.get().strip() or None, on_exist.get(),
-                                   True, False, log, progress, cancel)
-            state["out"] = out_join.get().strip() or str(Path(join_sources[0]).parent / "restored")
-            if isinstance(result, dict):
-                return "Восстановление завершено: {} полных, {} неполных".format(
-                    len(result["complete"]), len(result["incomplete"]))
-            return "Старые части собраны: {}".format(len(result))
+            result = restore_archives(inputs, target, mode, keep_partial, log, progress, cancel)
+            state["out"] = target or str(Path(inputs[0]).parent / "restored")
+            return "Восстановление завершено: {} полных, {} неполных".format(
+                len(result["complete"]), len(result["incomplete"]))
 
         start(job)
 
@@ -2409,11 +2570,15 @@ def run_gui():
             save_plan_button.configure(state="normal" if not state["running"] and not state["locked"] else "disabled")
             extend_button.configure(state="normal" if state["locked"] and not state["running"] else "disabled")
             add_to_plan_button.configure(state="normal" if state["locked"] and not state["running"] else "disabled")
+            status_button.configure(state="normal" if not state["running"] else "disabled")
+            verify_button.configure(state="normal" if state["locked"] and not state["running"] else "disabled")
         else:
             show_plan_button.configure(state="disabled")
             save_plan_button.configure(state="disabled")
             extend_button.configure(state="disabled")
             add_to_plan_button.configure(state="disabled")
+            status_button.configure(state="disabled")
+            verify_button.configure(state="disabled")
 
     notebook.bind("<<NotebookTabChanged>>", on_tab)
     if dnd:
@@ -2437,8 +2602,6 @@ def run_gui():
                     state["running"] = False
                     run_button.configure(state="normal")
                     cancel_button.configure(state="disabled")
-                    if state["out"]:
-                        open_button.configure(state="normal")
                     status_text.set(message)
                     add_log(message)
                     refresh_plan()
@@ -2483,8 +2646,8 @@ def build_parser():
 что другой процесс не работает. Восстановление принимает любые архивы в любом
 порядке и сохраняет неполные .tgspart в .tgsplit-restore.json.
 Сохраняются пути, режимы, mtime (секунды), ссылки и пустые папки; ACL, xattr,
-атрибуты Windows, uid/gid и жёсткие связи не сохраняются. Старые name.tar.001
-поддерживаются join. Без аргументов открывается окно.""",
+атрибуты Windows, uid/gid и жёсткие связи не сохраняются.
+Без аргументов открывается окно.""",
     )
     sub = ap.add_subparsers(dest="cmd", required=True)
     for command, help_text in (("plan", "только построить и сохранить план"),
@@ -2512,14 +2675,13 @@ def build_parser():
     vf = sub.add_parser("verify", help="проверить присутствующие архивы по .sha256")
     vf.add_argument("output", help="папка OUT или файл plan.json")
     vf.add_argument("-n", "--name", help="базовое имя NAME, если планов несколько")
-    j = sub.add_parser("join", help="восстановить любые архивы/окна или старые части .tar.001")
-    j.add_argument("paths", nargs="+", help="архивы TAR, папка или старая часть name.tar.001")
+    j = sub.add_parser("join", help="восстановить любые архивы/окна")
+    j.add_argument("paths", nargs="+", help="архивы TAR или папка")
     j.add_argument("-o", "--output", help="папка восстановления (по умолчанию restored)")
     j.add_argument("--on-exist", choices=("skip", "overwrite", "rename"), default="skip",
                    help="что делать с существующими файлами (по умолчанию skip)")
     j.add_argument("--discard-partial", action="store_true",
                    help="удалить неполные .tgspart после отчёта (по умолчанию сохранять для продолжения)")
-    j.add_argument("--merge-only", action="store_true", help="старый формат: только склеить, не распаковывать")
     sub.add_parser("gui", help="открыть графическое окно")
     return ap
 
@@ -2538,8 +2700,8 @@ def main(argv=None):
         elif args.cmd == "verify":
             verify_archives(args.output, args.name, cp.log)
         elif args.cmd == "join":
-            join_dispatch(args.paths, args.output, args.on_exist, not args.discard_partial,
-                          args.merge_only, cp.log, cp)
+            restore_archives(args.paths, args.output, args.on_exist, not args.discard_partial,
+                             cp.log, cp)
         elif args.cmd == "plan":
             save_plan_only(args.paths, args.output, parse_size(args.size), args.name, cp.log, cp)
         elif args.cmd == "extend":
